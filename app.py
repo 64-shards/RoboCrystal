@@ -20,6 +20,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
+from data_pipeline import build_forecast_features
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -79,42 +80,110 @@ def load_data() -> pd.DataFrame:
 # 2. Forecasting Engine
 # ---------------------------------------------------------------------------
 
-def forecast_costs(df: pd.DataFrame, degree: int = 2):
+FEATURE_COLUMNS = [
+    "year",
+    "inflation_rate",
+    "interest_rate",
+    "component_price_proxy",
+    "labor_shortage_proxy",
+    "inflation_delta",
+    "interest_delta",
+    "component_price_yoy_pct",
+    "labor_shortage_delta",
+    "inflation_roll3",
+    "interest_roll3",
+    "component_price_roll3",
+    "labor_shortage_roll3",
+    "inflation_lag1",
+    "interest_lag1",
+    "component_price_lag1",
+    "labor_shortage_lag1",
+    "tight_money_policy_flag",
+    "high_inflation_flag",
+]
+
+
+def _project_external_drivers(df: pd.DataFrame, end_year: int = FORECAST_END_YEAR) -> pd.DataFrame:
+    """Project external drivers forward with recent linear trend extrapolation."""
+    hist = df.sort_values("year").copy()
+    last_year = int(hist["year"].max())
+    future_years = np.arange(last_year + 1, end_year + 1)
+    if len(future_years) == 0:
+        return hist
+
+    driver_cols = [
+        "inflation_rate",
+        "interest_rate",
+        "component_price_proxy",
+        "labor_shortage_proxy",
+    ]
+
+    future_rows = {"year": future_years}
+    for col in driver_cols:
+        window = min(5, len(hist))
+        recent = hist.tail(window)
+        x = recent["year"].values
+        y = recent[col].values
+        slope, intercept = np.polyfit(x, y, 1)
+        projected = slope * future_years + intercept
+
+        if col in {"inflation_rate", "interest_rate", "labor_shortage_proxy"}:
+            projected = np.clip(projected, 0, None)
+
+        future_rows[col] = projected
+
+    future_df = pd.DataFrame(future_rows)
+    combined = pd.concat([hist, future_df], ignore_index=True)
+    return combined
+
+
+def _fit_linear_regression(X: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Solve linear regression with intercept using least squares."""
+    X_design = np.column_stack([np.ones(len(X)), X])
+    coeffs, *_ = np.linalg.lstsq(X_design, y, rcond=None)
+    return coeffs
+
+
+def _predict_linear_regression(coeffs: np.ndarray, X: np.ndarray) -> np.ndarray:
+    """Predict using least-squares coefficients."""
+    X_design = np.column_stack([np.ones(len(X)), X])
+    return X_design @ coeffs
+
+
+def forecast_costs(df: pd.DataFrame):
     """
-    Fit polynomial regression models to both the labor cost and robot cost
-    curves, then project forward to FORECAST_END_YEAR.
+    Train feature-matrix regressors for labor and robot cost and project
+    yearly values to FORECAST_END_YEAR using transformed macro features.
 
     Returns:
-        future_years  — array of years from last historical year+1 to 2040
+        all_years     — historical + forecast year axis
         labor_proj    — projected annual salary values
         robot_proj    — projected robot cost values
-        labor_coeffs  — polynomial coefficients for labor curve
-        robot_coeffs  — polynomial coefficients for robot curve
+        labor_coeffs  — linear regression coefficients for labor model
+        robot_coeffs  — linear regression coefficients for robot model
     """
-    years = df["year"].values
-    labor = df["annual_salary"].values
-    robot = df["robot_cost"].values
+    enriched = build_forecast_features(df)
+    extended = _project_external_drivers(enriched, FORECAST_END_YEAR)
+    feature_ready = build_forecast_features(extended)
 
-    # Fit polynomial models
-    labor_coeffs = np.polyfit(years, labor, degree)
-    robot_coeffs = np.polyfit(years, robot, degree)
+    train_mask = feature_ready["year"] <= enriched["year"].max()
+    train_df = feature_ready.loc[train_mask].copy()
 
-    # For the robot curve, also fit an exponential decay for better extrapolation
-    # log(cost) = a*year + b  →  cost = exp(a*year + b)
-    log_robot = np.log(robot)
-    robot_exp_coeffs = np.polyfit(years, log_robot, 1)  # linear in log-space
+    X_train = train_df[FEATURE_COLUMNS].values
+    labor_train = train_df["annual_salary"].values
+    robot_train = train_df["robot_cost"].values
 
-    # Build future year range (include historical for smooth plotting)
-    all_years = np.arange(years.min(), FORECAST_END_YEAR + 1)
-    future_years = np.arange(years.max() + 1, FORECAST_END_YEAR + 1)
+    labor_coeffs = _fit_linear_regression(X_train, labor_train)
+    robot_coeffs = _fit_linear_regression(X_train, robot_train)
 
-    # Project labor using polynomial (captures upward trend)
-    labor_all = np.polyval(labor_coeffs, all_years)
+    all_years = feature_ready["year"].values
+    X_all = feature_ready[FEATURE_COLUMNS].values
 
-    # Project robot using exponential decay (more realistic for tech costs)
-    robot_all = np.exp(np.polyval(robot_exp_coeffs, all_years))
+    labor_all = _predict_linear_regression(labor_coeffs, X_all)
+    robot_all = _predict_linear_regression(robot_coeffs, X_all)
+    robot_all = np.clip(robot_all, 0, None)
 
-    return all_years, labor_all, robot_all, labor_coeffs, robot_exp_coeffs
+    return all_years, labor_all, robot_all, labor_coeffs, robot_coeffs
 
 
 # ---------------------------------------------------------------------------
