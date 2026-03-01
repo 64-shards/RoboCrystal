@@ -21,6 +21,37 @@ import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
+
+SCENARIOS = {
+    "Base": {
+        "description": "Continuity case using historical trend rates.",
+        "labor_growth_shift": 0.0,
+        "robot_decay_shift": 0.0,
+        "labor_volatility": 0.007,
+        "robot_volatility": 0.02,
+    },
+    "Aggressive Automation": {
+        "description": "Faster robot cost declines and learning curves.",
+        "labor_growth_shift": 0.0,
+        "robot_decay_shift": 0.03,
+        "labor_volatility": 0.008,
+        "robot_volatility": 0.03,
+    },
+    "Labor Tightening": {
+        "description": "Wage inflation accelerates due to labor scarcity.",
+        "labor_growth_shift": 0.02,
+        "robot_decay_shift": 0.0,
+        "labor_volatility": 0.012,
+        "robot_volatility": 0.02,
+    },
+    "High Friction Deployment": {
+        "description": "Regulatory + integration frictions slow automation savings.",
+        "labor_growth_shift": 0.005,
+        "robot_decay_shift": -0.015,
+        "labor_volatility": 0.01,
+        "robot_volatility": 0.03,
+    },
+}
 from evaluation import compute_forecast_reliability, save_evaluation_history
 from model_registry import REGISTRY_PATH, get_champion_model, load_registry
 
@@ -164,6 +195,172 @@ def find_parity_year(
         return int(all_years[0]), round(labor_proj[0], 2)
 
     return None, None
+
+
+def estimate_baseline_rates(df: pd.DataFrame) -> tuple:
+    """Estimate annualized labor growth and robot decay rates from history."""
+    years_span = max(df["year"].max() - df["year"].min(), 1)
+    labor_rate = (df["annual_salary"].iloc[-1] / df["annual_salary"].iloc[0]) ** (1 / years_span) - 1
+    robot_rate = 1 - (df["robot_cost"].iloc[-1] / df["robot_cost"].iloc[0]) ** (1 / years_span)
+    return labor_rate, robot_rate
+
+
+def simulate_parity_distribution(
+    df: pd.DataFrame,
+    assumptions: dict,
+    n_sims: int,
+    target_years: list,
+    seed: int,
+) -> dict:
+    """Monte Carlo parity simulation for a single scenario."""
+    rng = np.random.default_rng(seed)
+    latest = df.sort_values("year").iloc[-1]
+    start_year = int(latest["year"])
+    labor_start = float(latest["annual_salary"])
+    robot_start = float(latest["robot_cost"])
+
+    base_labor_growth, base_robot_decay = estimate_baseline_rates(df)
+    labor_growth = max(base_labor_growth + assumptions["labor_growth_shift"], -0.05)
+    robot_decay = max(base_robot_decay + assumptions["robot_decay_shift"], -0.1)
+
+    parity_years = []
+    for _ in range(n_sims):
+        labor_value = labor_start
+        robot_value = robot_start
+        parity_year = None
+        for year in range(start_year + 1, FORECAST_END_YEAR + 1):
+            labor_noise = rng.normal(0, assumptions["labor_volatility"])
+            robot_noise = rng.normal(0, assumptions["robot_volatility"])
+
+            labor_value *= 1 + labor_growth + labor_noise
+            robot_value *= max(1 - robot_decay + robot_noise, 0.6)
+
+            if robot_value <= labor_value:
+                parity_year = year
+                break
+        parity_years.append(parity_year)
+
+    valid_years = [year for year in parity_years if year is not None]
+    median_year = int(np.median(valid_years)) if valid_years else None
+
+    probability_by_target = {}
+    for year in target_years:
+        probability_by_target[year] = round(
+            100 * np.mean([(p is not None) and (p <= year) for p in parity_years]), 1
+        )
+
+    return {
+        "parity_years": parity_years,
+        "median_parity_year": median_year,
+        "probability_by_target": probability_by_target,
+        "effective_rates": {
+            "labor_growth": labor_growth,
+            "robot_decay": robot_decay,
+        },
+    }
+
+
+def build_parity_distribution_overlay(results: dict) -> go.Figure:
+    """Overlay histograms of parity year distributions across scenarios."""
+    fig = go.Figure()
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+    for i, (scenario_name, result) in enumerate(results.items()):
+        valid = [p for p in result["parity_years"] if p is not None]
+        if not valid:
+            continue
+        fig.add_trace(
+            go.Histogram(
+                x=valid,
+                histnorm="probability density",
+                name=scenario_name,
+                opacity=0.5,
+                marker_color=colors[i % len(colors)],
+                xbins=dict(start=min(valid) - 0.5, end=FORECAST_END_YEAR + 0.5, size=1),
+            )
+        )
+
+    fig.update_layout(
+        barmode="overlay",
+        template="plotly_white",
+        height=460,
+        title="Parity Distribution Overlay by Scenario",
+        xaxis_title="Parity Year",
+        yaxis_title="Density",
+    )
+    return fig
+
+
+def build_decision_brief(
+    selected_scenarios: list,
+    scenario_results: dict,
+    target_years: list,
+    latest_year: int,
+) -> str:
+    """Build a markdown decision brief for download."""
+    lines = [
+        "# Bipedal Parity Decision Brief",
+        "",
+        "## Saved assumptions by scenario",
+    ]
+    for name in selected_scenarios:
+        assumptions = SCENARIOS[name]
+        lines.extend(
+            [
+                f"### {name}",
+                f"- Context: {assumptions['description']}",
+                f"- Labor growth shift: {assumptions['labor_growth_shift']:+.2%}",
+                f"- Robot decay shift: {assumptions['robot_decay_shift']:+.2%}",
+                f"- Labor volatility: ±{assumptions['labor_volatility']:.2%}",
+                f"- Robot volatility: ±{assumptions['robot_volatility']:.2%}",
+                "",
+            ]
+        )
+
+    lines.append("## Key parity probabilities")
+    for name in selected_scenarios:
+        result = scenario_results[name]
+        lines.append(f"### {name}")
+        lines.append(
+            f"- Median parity year: {result['median_parity_year'] if result['median_parity_year'] else f'>{FORECAST_END_YEAR}'}"
+        )
+        for year in target_years:
+            lines.append(f"- P(parity by {year}): {result['probability_by_target'][year]:.1f}%")
+        lines.append("")
+
+    base_result = scenario_results.get("Base")
+    if base_result:
+        base_median = base_result["median_parity_year"]
+        lines.append("## Recommended actions")
+        for name in selected_scenarios:
+            if name == "Base":
+                continue
+            median_year = scenario_results[name]["median_parity_year"]
+            if base_median is None or median_year is None:
+                action = "Maintain optionality: no robust parity signal before forecast horizon."
+            elif median_year < base_median:
+                delta = base_median - median_year
+                action = (
+                    f"Accelerate automation pilots now; scenario gains ~{delta} year(s) vs base. "
+                    "Prioritize integrator partnerships and capex readiness."
+                )
+            else:
+                delta = median_year - base_median
+                action = (
+                    f"Stage investments with decision gates; scenario loses ~{delta} year(s) vs base. "
+                    "Focus on labor productivity and phased retrofits."
+                )
+            lines.append(f"- **{name}:** {action}")
+
+    lines.extend(
+        [
+            "",
+            "## Notes",
+            f"- Baseline reference year: {latest_year}",
+            f"- Forecast horizon: through {FORECAST_END_YEAR}",
+            "- This brief is generated from stochastic simulations and should be paired with operating constraints and financing assumptions.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -353,19 +550,52 @@ def main():
     current_labor = latest["annual_salary"]
     current_robot = latest["robot_cost"]
 
+    # ==================== SCENARIO CONTROLS ====================
+    st.sidebar.markdown("### 🎯 Scenario Studio")
+    selected_scenarios = st.sidebar.multiselect(
+        "Select scenarios to run in one execution",
+        list(SCENARIOS.keys()),
+        default=["Base", "Aggressive Automation", "Labor Tightening"],
+    )
+    simulation_runs = st.sidebar.slider("Monte Carlo runs", min_value=200, max_value=5000, value=1200, step=100)
+    target_years = st.sidebar.multiselect(
+        "Target years for parity probability",
+        options=list(range(int(latest["year"]) + 1, FORECAST_END_YEAR + 1)),
+        default=[2030, 2035, 2040],
+    )
+    if not selected_scenarios:
+        st.error("Please select at least one scenario.")
+        st.stop()
+    if not target_years:
+        st.error("Please choose at least one target year for comparison.")
+        st.stop()
+
+    scenario_results = {}
+    for index, scenario_name in enumerate(selected_scenarios):
+        scenario_results[scenario_name] = simulate_parity_distribution(
+            df=df,
+            assumptions=SCENARIOS[scenario_name],
+            n_sims=simulation_runs,
+            target_years=target_years,
+            seed=42 + index,
+        )
+
     # ==================== TOP METRIC ====================
     st.markdown("---")
-    if parity_year:
+    base_result = scenario_results.get("Base")
+    base_display_year = base_result["median_parity_year"] if base_result else parity_year
+    base_display_cost = parity_cost
+    if base_display_year:
         st.markdown(
             f"""
             <div style="background: linear-gradient(135deg, #ff4b4b 0%, #ff8c00 100%);
                         padding: 30px; border-radius: 12px; text-align: center;
                         margin-bottom: 20px;">
                 <h1 style="color: white; font-size: 2.8em; margin: 0;">
-                    🚨 ALERT: Bipedal Parity Forecasted for {parity_year}
+                    🚨 ALERT: Base Scenario Parity Forecasted for {base_display_year}
                 </h1>
                 <p style="color: #ffffffcc; font-size: 1.2em; margin-top: 10px;">
-                    Estimated crossover cost: ${parity_cost:,.0f} / year
+                    Deterministic crossover estimate: ${base_display_cost:,.0f} / year
                 </p>
             </div>
             """,
@@ -380,9 +610,9 @@ def main():
     col1, col2, col3 = st.columns(3)
     col1.metric("Current Labor Cost", f"${current_labor:,.0f}/yr")
     col2.metric("Current Robot Cost", f"${current_robot:,.0f}/yr")
-    if parity_year:
-        years_away = parity_year - int(latest["year"])
-        col3.metric("Years to Parity", f"{years_away} yrs", delta=f"Target: {parity_year}")
+    if base_display_year:
+        years_away = base_display_year - int(latest["year"])
+        col3.metric("Years to Base Parity", f"{years_away} yrs", delta=f"Target: {base_display_year}")
 
     # ==================== FORECAST RELIABILITY ====================
     st.markdown("---")
@@ -421,9 +651,9 @@ def main():
     st.markdown("---")
     st.subheader("📋 Executive Alert — AI Strategic Signal")
 
-    if parity_year:
+    if base_display_year:
         with st.spinner("Generating AI executive alert via Gemini…"):
-            alert_text = generate_executive_alert(parity_year, current_labor, current_robot)
+            alert_text = generate_executive_alert(base_display_year, current_labor, current_robot)
         st.markdown(
             f"""
             <div style="background-color: #f0f2f6; padding: 20px; border-radius: 10px;
@@ -443,6 +673,48 @@ def main():
     fig = build_chart(df, all_years, labor_proj, robot_proj, parity_year, parity_cost)
     st.plotly_chart(fig, use_container_width=True)
 
+    st.markdown("---")
+    st.subheader("🧭 Scenario Forecast Comparison")
+
+    distribution_fig = build_parity_distribution_overlay(scenario_results)
+    st.plotly_chart(distribution_fig, use_container_width=True)
+
+    comparison_rows = []
+    base_median_year = scenario_results["Base"]["median_parity_year"] if "Base" in scenario_results else None
+    for scenario_name in selected_scenarios:
+        result = scenario_results[scenario_name]
+        row = {
+            "Scenario": scenario_name,
+            "Median Parity Year": result["median_parity_year"] if result["median_parity_year"] else f">{FORECAST_END_YEAR}",
+            "Δ vs Base (years)": "—",
+        }
+        if base_median_year and result["median_parity_year"]:
+            row["Δ vs Base (years)"] = result["median_parity_year"] - base_median_year
+        for year in sorted(target_years):
+            row[f"P(parity by {year})"] = f"{result['probability_by_target'][year]:.1f}%"
+        comparison_rows.append(row)
+
+    comparison_df = pd.DataFrame(comparison_rows)
+    st.dataframe(comparison_df, use_container_width=True)
+
+    st.caption("Negative delta means faster parity than Base (years gained). Positive delta means delay (years lost).")
+
+    st.markdown("---")
+    st.subheader("📝 Export Decision Brief")
+    brief_text = build_decision_brief(
+        selected_scenarios=selected_scenarios,
+        scenario_results=scenario_results,
+        target_years=sorted(target_years),
+        latest_year=int(latest["year"]),
+    )
+    st.download_button(
+        label="Export decision brief (Markdown)",
+        data=brief_text,
+        file_name="bipedal_parity_decision_brief.md",
+        mime="text/markdown",
+    )
+    with st.expander("Preview brief"):
+        st.markdown(brief_text)
     # ==================== DRIFT & ALERT MONITORING ====================
     st.markdown("---")
     st.subheader("🚨 Drift Monitoring Alerts")
