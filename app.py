@@ -21,6 +21,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
+from evaluation import compute_forecast_reliability, save_evaluation_history
 from model_registry import REGISTRY_PATH, get_champion_model, load_registry
 
 # ---------------------------------------------------------------------------
@@ -34,6 +35,7 @@ MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "historical_costs")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 FORECAST_END_YEAR = 2040
+MODEL_VERSION = "poly2_labor-exp1_robot_v1"
 MONITORING_DIR = os.path.join(os.path.dirname(__file__), "monitoring")
 ALERT_LOG_PATH = os.path.join(MONITORING_DIR, "alert_events.csv")
 
@@ -343,6 +345,8 @@ def main():
     with st.spinner("Running forecast models…"):
         all_years, labor_proj, robot_proj, _, _ = forecast_costs(df)
         parity_year, parity_cost = find_parity_year(all_years, labor_proj, robot_proj)
+        reliability_metrics = compute_forecast_reliability(df, degree=2)
+        latest_history = save_evaluation_history(reliability_metrics, model_version=MODEL_VERSION).iloc[-1]
 
     # Current values (most recent year in dataset)
     latest = df.sort_values("year").iloc[-1]
@@ -379,6 +383,39 @@ def main():
     if parity_year:
         years_away = parity_year - int(latest["year"])
         col3.metric("Years to Parity", f"{years_away} yrs", delta=f"Target: {parity_year}")
+
+    # ==================== FORECAST RELIABILITY ====================
+    st.markdown("---")
+    st.subheader("🛡️ Forecast Reliability")
+    latest_coverage = reliability_metrics.get("interval_coverage_rate")
+    target_coverage = reliability_metrics.get("coverage_target", 0.80)
+    avg_width = reliability_metrics.get("average_interval_width")
+    calibration = reliability_metrics.get("calibration_by_horizon", {})
+
+    rel_col1, rel_col2, rel_col3 = st.columns(3)
+    if latest_coverage is None:
+        rel_col1.metric("P10–P90 Coverage", "N/A")
+        rel_col2.metric("Coverage Target", f"{target_coverage:.0%}")
+        rel_col3.metric("Avg Interval Width", "N/A")
+        st.caption("Not enough data points for reliability backtesting.")
+    else:
+        rel_col1.metric(
+            "P10–P90 Coverage",
+            f"{latest_coverage:.1%}",
+            delta=f"vs target {target_coverage:.0%}",
+        )
+        rel_col2.metric("Coverage Target", f"{target_coverage:.0%}")
+        rel_col3.metric("Avg Interval Width", f"${avg_width:,.0f}")
+        st.caption(
+            "Calibration by horizon: "
+            + ", ".join(
+                f"{h}y={value:.1%}" if value is not None else f"{h}y=N/A"
+                for h, value in calibration.items()
+            )
+        )
+        st.caption(
+            f"Latest run: {latest_history['timestamp']} • model: {latest_history['model_version']}"
+        )
 
     # ==================== EXECUTIVE ALERT (GEMINI) ====================
     st.markdown("---")
