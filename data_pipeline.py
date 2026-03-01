@@ -38,6 +38,25 @@ HOURS_PER_YEAR = 2080  # 40 hrs/week × 52 weeks
 ROBOT_COST_2010 = 500_000  # USD in 2010
 ANNUAL_DECAY_RATE = 0.10    # 10 % cost reduction per year
 
+# Segment dimensions + simple multipliers to create segment-level outputs
+SEGMENT_VALUES = {
+    "region": ["north_america", "europe", "asia"],
+    "industry": ["automotive", "electronics", "logistics"],
+    "task_type": ["assembly", "inspection", "material_handling"],
+}
+
+WAGE_MULTIPLIERS = {
+    "region": {"north_america": 1.00, "europe": 0.95, "asia": 0.75},
+    "industry": {"automotive": 1.08, "electronics": 1.00, "logistics": 0.92},
+    "task_type": {"assembly": 1.00, "inspection": 1.05, "material_handling": 0.90},
+}
+
+ROBOT_MULTIPLIERS = {
+    "region": {"north_america": 1.05, "europe": 1.02, "asia": 0.92},
+    "industry": {"automotive": 0.98, "electronics": 1.00, "logistics": 0.95},
+    "task_type": {"assembly": 1.00, "inspection": 1.08, "material_handling": 0.93},
+}
+
 
 # ---------------------------------------------------------------------------
 # 1. Fetch FRED Manufacturing Wage Data
@@ -135,8 +154,49 @@ def generate_robot_costs(
 def merge_datasets(wages_df: pd.DataFrame, robot_df: pd.DataFrame) -> pd.DataFrame:
     """Merge wage and robot cost DataFrames on year."""
     merged = pd.merge(wages_df, robot_df, on="year", how="inner")
+    merged = expand_segmented_dataset(merged)
     print(f"[INFO] Merged dataset has {len(merged)} rows.")
     return merged
+
+
+def expand_segmented_dataset(base_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Expand year-level data into segment-level rows.
+
+    Adds segmentation keys: region, industry, task_type, segment_id.
+    Applies deterministic multipliers so each segment has distinct cost profiles.
+    """
+    segmented_rows = []
+
+    for _, row in base_df.iterrows():
+        for region in SEGMENT_VALUES["region"]:
+            for industry in SEGMENT_VALUES["industry"]:
+                for task_type in SEGMENT_VALUES["task_type"]:
+                    wage_multiplier = (
+                        WAGE_MULTIPLIERS["region"][region]
+                        * WAGE_MULTIPLIERS["industry"][industry]
+                        * WAGE_MULTIPLIERS["task_type"][task_type]
+                    )
+                    robot_multiplier = (
+                        ROBOT_MULTIPLIERS["region"][region]
+                        * ROBOT_MULTIPLIERS["industry"][industry]
+                        * ROBOT_MULTIPLIERS["task_type"][task_type]
+                    )
+
+                    segmented_rows.append(
+                        {
+                            "year": int(row["year"]),
+                            "region": region,
+                            "industry": industry,
+                            "task_type": task_type,
+                            "segment_id": f"{region}|{industry}|{task_type}",
+                            "hourly_wage": round(float(row["hourly_wage"]) * wage_multiplier, 2),
+                            "annual_salary": round(float(row["annual_salary"]) * wage_multiplier, 2),
+                            "robot_cost": round(float(row["robot_cost"]) * robot_multiplier, 2),
+                        }
+                    )
+
+    return pd.DataFrame(segmented_rows)
 
 
 def push_to_mongodb(df: pd.DataFrame) -> bool:
@@ -213,4 +273,3 @@ if __name__ == "__main__":
     result = run_pipeline()
     print("\nPreview:")
     print(result.to_string(index=False))
-

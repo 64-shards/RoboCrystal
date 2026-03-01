@@ -32,6 +32,8 @@ MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "historical_costs")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 FORECAST_END_YEAR = 2040
+DEFAULT_TARGET_YEAR = 2032
+SIMULATION_RUNS = 400
 
 # ---------------------------------------------------------------------------
 # 1. Data Retrieval
@@ -115,6 +117,98 @@ def forecast_costs(df: pd.DataFrame, degree: int = 2):
     robot_all = np.exp(np.polyval(robot_exp_coeffs, all_years))
 
     return all_years, labor_all, robot_all, labor_coeffs, robot_exp_coeffs
+
+
+def forecast_parity_by_segment(
+    df: pd.DataFrame,
+    target_year: int,
+    degree: int = 2,
+    simulation_runs: int = SIMULATION_RUNS,
+) -> pd.DataFrame:
+    """
+    Run parity simulations per segment and return summary stats.
+
+    Output columns:
+      - segment_id
+      - median_parity_year
+      - p10_parity_year
+      - p90_parity_year
+      - parity_by_target_year_probability
+    """
+    required = ["segment_id", "region", "industry", "task_type", "year", "annual_salary", "robot_cost"]
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns for segmented forecast: {missing}")
+
+    rows = []
+    for segment_id, segment_df in df.groupby("segment_id"):
+        segment_df = segment_df.sort_values("year")
+        if len(segment_df) < max(5, degree + 2):
+            continue
+
+        years = segment_df["year"].values
+        labor = segment_df["annual_salary"].values
+        robot = segment_df["robot_cost"].values
+
+        labor_coeffs = np.polyfit(years, labor, degree)
+        log_robot = np.log(robot)
+        robot_exp_coeffs = np.polyfit(years, log_robot, 1)
+
+        labor_fit = np.polyval(labor_coeffs, years)
+        robot_log_fit = np.polyval(robot_exp_coeffs, years)
+
+        labor_resid_std = max(np.std(labor - labor_fit), 1.0)
+        robot_log_resid_std = max(np.std(log_robot - robot_log_fit), 0.01)
+
+        sim_parity_years = []
+        all_years = np.arange(years.min(), FORECAST_END_YEAR + 1)
+        baseline_labor = np.polyval(labor_coeffs, all_years)
+        baseline_robot = np.exp(np.polyval(robot_exp_coeffs, all_years))
+
+        for _ in range(simulation_runs):
+            labor_sim = baseline_labor + np.random.normal(0, labor_resid_std, size=len(all_years))
+            robot_sim = baseline_robot * np.exp(
+                np.random.normal(0, robot_log_resid_std, size=len(all_years))
+            )
+            parity_year, _ = find_parity_year(all_years, labor_sim, robot_sim)
+            if parity_year is not None:
+                sim_parity_years.append(parity_year)
+
+        segment_meta = segment_df.iloc[0]
+        if sim_parity_years:
+            parity_array = np.array(sim_parity_years)
+            median_parity = int(np.median(parity_array))
+            p10 = int(np.percentile(parity_array, 10))
+            p90 = int(np.percentile(parity_array, 90))
+        else:
+            median_parity = np.nan
+            p10 = np.nan
+            p90 = np.nan
+
+        probability = (np.array(sim_parity_years) <= target_year).mean() if sim_parity_years else 0.0
+
+        rows.append(
+            {
+                "segment_id": segment_id,
+                "region": segment_meta["region"],
+                "industry": segment_meta["industry"],
+                "task_type": segment_meta["task_type"],
+                "median_parity_year": median_parity,
+                "p10_parity_year": p10,
+                "p90_parity_year": p90,
+                "parity_by_target_year_probability": probability,
+            }
+        )
+
+    summary = pd.DataFrame(rows)
+    if summary.empty:
+        return summary
+
+    return summary.sort_values(
+        ["median_parity_year", "parity_by_target_year_probability"],
+        ascending=[True, False],
+        na_position="last",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -315,13 +409,70 @@ def main():
         st.error("No data available. Please run `data_pipeline.py` first.")
         st.stop()
 
+    required_segment_cols = {"segment_id", "region", "industry", "task_type"}
+    if not required_segment_cols.issubset(df.columns):
+        st.error(
+            "Segment columns missing from dataset. Re-run `python data_pipeline.py` "
+            "to regenerate data with segmentation keys."
+        )
+        st.stop()
+
+    # --- Segment Filters ---
+    st.sidebar.markdown("### 🎛️ Segment Filters")
+    selected_regions = st.sidebar.multiselect(
+        "Region",
+        sorted(df["region"].unique()),
+        default=sorted(df["region"].unique()),
+    )
+    selected_industries = st.sidebar.multiselect(
+        "Industry",
+        sorted(df["industry"].unique()),
+        default=sorted(df["industry"].unique()),
+    )
+    selected_tasks = st.sidebar.multiselect(
+        "Task type",
+        sorted(df["task_type"].unique()),
+        default=sorted(df["task_type"].unique()),
+    )
+    target_year = st.sidebar.slider(
+        "Target year for parity probability",
+        min_value=int(df["year"].min()) + 1,
+        max_value=FORECAST_END_YEAR,
+        value=DEFAULT_TARGET_YEAR,
+    )
+
+    filtered_df = df[
+        df["region"].isin(selected_regions)
+        & df["industry"].isin(selected_industries)
+        & df["task_type"].isin(selected_tasks)
+    ].copy()
+
+    if filtered_df.empty:
+        st.warning("No rows match the selected segment filters.")
+        st.stop()
+
+    with st.spinner("Running segmented parity simulations…"):
+        segment_summary = forecast_parity_by_segment(filtered_df, target_year=target_year)
+
+    if segment_summary.empty:
+        st.warning("Unable to compute segmented forecast with current filters.")
+        st.stop()
+
+    # Choose one segment for detailed charting
+    selected_segment_id = st.selectbox(
+        "Select a segment for detailed trajectory",
+        segment_summary["segment_id"].tolist(),
+        index=0,
+    )
+    chart_df = filtered_df[filtered_df["segment_id"] == selected_segment_id].sort_values("year")
+
     # --- Forecasting ---
     with st.spinner("Running forecast models…"):
-        all_years, labor_proj, robot_proj, _, _ = forecast_costs(df)
+        all_years, labor_proj, robot_proj, _, _ = forecast_costs(chart_df)
         parity_year, parity_cost = find_parity_year(all_years, labor_proj, robot_proj)
 
     # Current values (most recent year in dataset)
-    latest = df.sort_values("year").iloc[-1]
+    latest = chart_df.sort_values("year").iloc[-1]
     current_labor = latest["annual_salary"]
     current_robot = latest["robot_cost"]
 
@@ -379,8 +530,37 @@ def main():
     st.markdown("---")
     st.subheader("📈 Cost Trajectory & Parity Forecast")
 
-    fig = build_chart(df, all_years, labor_proj, robot_proj, parity_year, parity_cost)
+    fig = build_chart(chart_df, all_years, labor_proj, robot_proj, parity_year, parity_cost)
     st.plotly_chart(fig, use_container_width=True)
+
+    # ==================== SEGMENT RANKING ====================
+    st.markdown("---")
+    st.subheader("🏁 Earliest Likely Parity Segments")
+    st.caption(
+        f"Ranked by earliest median parity year and confidence of reaching parity by {target_year}."
+    )
+
+    ranking = segment_summary.copy()
+    ranking_display = ranking[[
+        "segment_id",
+        "median_parity_year",
+        "p10_parity_year",
+        "p90_parity_year",
+        "parity_by_target_year_probability",
+    ]].rename(
+        columns={
+            "segment_id": "Segment ID",
+            "median_parity_year": "Median parity year",
+            "p10_parity_year": "P10 parity year",
+            "p90_parity_year": "P90 parity year",
+            "parity_by_target_year_probability": f"P(parity ≤ {target_year})",
+        }
+    )
+
+    st.dataframe(
+        ranking_display.style.format({f"P(parity ≤ {target_year})": "{:.1%}"}),
+        use_container_width=True,
+    )
 
     # ==================== RAW DATA ====================
     with st.expander("📊 View Historical Data Table"):
