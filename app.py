@@ -22,6 +22,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from evaluation import compute_forecast_reliability, save_evaluation_history
+from model_registry import REGISTRY_PATH, get_champion_model, load_registry
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -35,6 +36,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 FORECAST_END_YEAR = 2040
 MODEL_VERSION = "poly2_labor-exp1_robot_v1"
+MONITORING_DIR = os.path.join(os.path.dirname(__file__), "monitoring")
+ALERT_LOG_PATH = os.path.join(MONITORING_DIR, "alert_events.csv")
 
 # ---------------------------------------------------------------------------
 # 1. Data Retrieval
@@ -77,6 +80,16 @@ def load_data() -> pd.DataFrame:
     from data_pipeline import run_pipeline
     return run_pipeline()
 
+
+
+
+def load_champion_metadata():
+    """Load champion model metadata from the local model registry."""
+    try:
+        registry = load_registry(REGISTRY_PATH)
+        return get_champion_model(registry)
+    except Exception:
+        return None
 
 # ---------------------------------------------------------------------------
 # 2. Forecasting Engine
@@ -293,6 +306,16 @@ def generate_executive_alert(
         return f"_Gemini API error:_ {e}"
 
 
+def load_alert_events() -> pd.DataFrame:
+    """Load persisted alert events created by the data pipeline."""
+    if os.path.exists(ALERT_LOG_PATH):
+        alerts = pd.read_csv(ALERT_LOG_PATH)
+        if not alerts.empty:
+            alerts["event_ts"] = pd.to_datetime(alerts["event_ts"], errors="coerce")
+        return alerts
+    return pd.DataFrame()
+
+
 # ---------------------------------------------------------------------------
 # 6. Streamlit UI Layout
 # ---------------------------------------------------------------------------
@@ -420,6 +443,49 @@ def main():
     fig = build_chart(df, all_years, labor_proj, robot_proj, parity_year, parity_cost)
     st.plotly_chart(fig, use_container_width=True)
 
+    # ==================== DRIFT & ALERT MONITORING ====================
+    st.markdown("---")
+    st.subheader("🚨 Drift Monitoring Alerts")
+
+    alerts_df = load_alert_events()
+    if alerts_df.empty:
+        st.info("No alert history found yet. Run `python data_pipeline.py` to initialize monitoring.")
+    else:
+        active = alerts_df[alerts_df["is_active"] == True].copy()  # noqa: E712
+        severity_order = {"critical": 3, "warning": 2, "info": 1}
+
+        if active.empty:
+            st.success("No active drift alerts in the latest pipeline run.")
+        else:
+            active["_severity_rank"] = active["severity"].map(severity_order).fillna(0)
+            active = active.sort_values(["_severity_rank", "event_ts"], ascending=[False, False])
+            for _, alert in active.iterrows():
+                icon = "🔴" if alert["severity"] == "critical" else "🟠"
+                st.markdown(
+                    f"{icon} **{str(alert['severity']).upper()}** — `{alert['category']}` / `{alert['metric']}`  \\n{alert['message']}"
+                )
+
+        with st.expander("🗂️ Historical Alert Log", expanded=False):
+            history = alerts_df.sort_values("event_ts", ascending=False).copy()
+            history["event_ts"] = history["event_ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
+            st.dataframe(
+                history[
+                    [
+                        "event_ts",
+                        "run_id",
+                        "severity",
+                        "category",
+                        "metric",
+                        "value",
+                        "baseline",
+                        "delta",
+                        "message",
+                        "is_active",
+                    ]
+                ],
+                use_container_width=True,
+            )
+
     # ==================== RAW DATA ====================
     with st.expander("📊 View Historical Data Table"):
         st.dataframe(
@@ -430,15 +496,41 @@ def main():
         )
 
     # ==================== SIDEBAR INFO ====================
+    champion = load_champion_metadata()
+
     st.sidebar.markdown("---")
     st.sidebar.markdown("### ⚙️ Configuration")
     st.sidebar.markdown(f"**Forecast horizon:** {FORECAST_END_YEAR}")
     st.sidebar.markdown(f"**MongoDB:** {'Connected' if MONGO_URI else 'Local CSV mode'}")
     st.sidebar.markdown(f"**Gemini API:** {'Configured' if GEMINI_API_KEY else 'Not set'}")
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🏆 Current Champion Model")
+    if champion:
+        st.sidebar.markdown(f"**Model ID:** `{champion.get('id', 'n/a')}`")
+        st.sidebar.markdown(f"**Family:** {champion.get('family', 'n/a')}")
+
+        training = champion.get("training_data", {})
+        st.sidebar.markdown(
+            f"**Training range:** {training.get('start_year', 'n/a')} - {training.get('end_year', 'n/a')}"
+        )
+        st.sidebar.markdown(f"**Data version:** `{training.get('version', 'n/a')}`")
+
+        metrics = champion.get("backtest_metrics", {})
+        st.sidebar.markdown(
+            f"**Combined MAPE:** {metrics.get('combined_mape', float('nan')):.2%}"
+            if isinstance(metrics.get('combined_mape'), (float, int))
+            else "**Combined MAPE:** n/a"
+        )
+        st.sidebar.markdown(f"**Status:** `{champion.get('promotion_status', 'n/a')}`")
+    else:
+        st.sidebar.info("No champion metadata found. Run `python backtest_models.py`.")
+
     st.sidebar.markdown("---")
     st.sidebar.markdown(
         "Built for the **Bipedal Parity Hackathon** 🏗️\n\n"
-        "Run `python data_pipeline.py` to refresh data."
+        "Run `python data_pipeline.py` to refresh data.\n"
+        "Run `python backtest_models.py` to evaluate/promote models."
     )
 
 
