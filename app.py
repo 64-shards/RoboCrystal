@@ -21,6 +21,8 @@ import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
+from model_registry import REGISTRY_PATH, get_champion_model, load_registry
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -74,6 +76,16 @@ def load_data() -> pd.DataFrame:
     from data_pipeline import run_pipeline
     return run_pipeline()
 
+
+
+
+def load_champion_metadata():
+    """Load champion model metadata from the local model registry."""
+    try:
+        registry = load_registry(REGISTRY_PATH)
+        return get_champion_model(registry)
+    except Exception:
+        return None
 
 # ---------------------------------------------------------------------------
 # 2. Forecasting Engine
@@ -392,15 +404,41 @@ def main():
         )
 
     # ==================== SIDEBAR INFO ====================
+    champion = load_champion_metadata()
+
     st.sidebar.markdown("---")
     st.sidebar.markdown("### ⚙️ Configuration")
     st.sidebar.markdown(f"**Forecast horizon:** {FORECAST_END_YEAR}")
     st.sidebar.markdown(f"**MongoDB:** {'Connected' if MONGO_URI else 'Local CSV mode'}")
     st.sidebar.markdown(f"**Gemini API:** {'Configured' if GEMINI_API_KEY else 'Not set'}")
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🏆 Current Champion Model")
+    if champion:
+        st.sidebar.markdown(f"**Model ID:** `{champion.get('id', 'n/a')}`")
+        st.sidebar.markdown(f"**Family:** {champion.get('family', 'n/a')}")
+
+        training = champion.get("training_data", {})
+        st.sidebar.markdown(
+            f"**Training range:** {training.get('start_year', 'n/a')} - {training.get('end_year', 'n/a')}"
+        )
+        st.sidebar.markdown(f"**Data version:** `{training.get('version', 'n/a')}`")
+
+        metrics = champion.get("backtest_metrics", {})
+        st.sidebar.markdown(
+            f"**Combined MAPE:** {metrics.get('combined_mape', float('nan')):.2%}"
+            if isinstance(metrics.get('combined_mape'), (float, int))
+            else "**Combined MAPE:** n/a"
+        )
+        st.sidebar.markdown(f"**Status:** `{champion.get('promotion_status', 'n/a')}`")
+    else:
+        st.sidebar.info("No champion metadata found. Run `python backtest_models.py`.")
+
     st.sidebar.markdown("---")
     st.sidebar.markdown(
         "Built for the **Bipedal Parity Hackathon** 🏗️\n\n"
-        "Run `python data_pipeline.py` to refresh data."
+        "Run `python data_pipeline.py` to refresh data.\n"
+        "Run `python backtest_models.py` to evaluate/promote models."
     )
 
 

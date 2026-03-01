@@ -1,0 +1,56 @@
+{
+  "updated_at": "2026-03-01T00:00:00+00:00",
+  "champion_id": "labor_poly2_robot_exp1",
+  "promotion_policy": {
+    "min_relative_improvement": 0.05,
+    "max_combined_mape": 0.15,
+    "minimum_splits": 8
+  },
+  "models": [
+    {
+      "id": "labor_poly2_robot_exp1",
+      "family": "poly+exp",
+      "training_data": {
+        "start_year": 2010,
+        "end_year": 2025,
+        "version": "bootstrap-v1"
+      },
+      "hyperparameters": {
+        "labor_poly_degree": 2,
+        "robot_model": "exp",
+        "robot_poly_degree": null
+      },
+      "backtest_metrics": {
+        "splits": 8,
+        "labor_mape": 0.021,
+        "robot_mape": 0.063,
+        "combined_mape": 0.042
+      },
+      "promotion_status": "champion",
+      "evaluated_at": "2026-03-01T00:00:00+00:00",
+      "promotion_note": "Bootstrap champion seeded for first run."
+    },
+    {
+      "id": "labor_poly3_robot_exp1",
+      "family": "poly+exp",
+      "training_data": {
+        "start_year": 2010,
+        "end_year": 2025,
+        "version": "bootstrap-v1"
+      },
+      "hyperparameters": {
+        "labor_poly_degree": 3,
+        "robot_model": "exp",
+        "robot_poly_degree": null
+      },
+      "backtest_metrics": {
+        "splits": 8,
+        "labor_mape": 0.028,
+        "robot_mape": 0.071,
+        "combined_mape": 0.049
+      },
+      "promotion_status": "challenger",
+      "evaluated_at": "2026-03-01T00:00:00+00:00"
+    }
+  ]
+}
