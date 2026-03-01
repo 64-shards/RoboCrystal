@@ -32,6 +32,8 @@ MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "historical_costs")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 FORECAST_END_YEAR = 2040
+MONITORING_DIR = os.path.join(os.path.dirname(__file__), "monitoring")
+ALERT_LOG_PATH = os.path.join(MONITORING_DIR, "alert_events.csv")
 
 # ---------------------------------------------------------------------------
 # 1. Data Retrieval
@@ -290,6 +292,16 @@ def generate_executive_alert(
         return f"_Gemini API error:_ {e}"
 
 
+def load_alert_events() -> pd.DataFrame:
+    """Load persisted alert events created by the data pipeline."""
+    if os.path.exists(ALERT_LOG_PATH):
+        alerts = pd.read_csv(ALERT_LOG_PATH)
+        if not alerts.empty:
+            alerts["event_ts"] = pd.to_datetime(alerts["event_ts"], errors="coerce")
+        return alerts
+    return pd.DataFrame()
+
+
 # ---------------------------------------------------------------------------
 # 6. Streamlit UI Layout
 # ---------------------------------------------------------------------------
@@ -381,6 +393,49 @@ def main():
 
     fig = build_chart(df, all_years, labor_proj, robot_proj, parity_year, parity_cost)
     st.plotly_chart(fig, use_container_width=True)
+
+    # ==================== DRIFT & ALERT MONITORING ====================
+    st.markdown("---")
+    st.subheader("🚨 Drift Monitoring Alerts")
+
+    alerts_df = load_alert_events()
+    if alerts_df.empty:
+        st.info("No alert history found yet. Run `python data_pipeline.py` to initialize monitoring.")
+    else:
+        active = alerts_df[alerts_df["is_active"] == True].copy()  # noqa: E712
+        severity_order = {"critical": 3, "warning": 2, "info": 1}
+
+        if active.empty:
+            st.success("No active drift alerts in the latest pipeline run.")
+        else:
+            active["_severity_rank"] = active["severity"].map(severity_order).fillna(0)
+            active = active.sort_values(["_severity_rank", "event_ts"], ascending=[False, False])
+            for _, alert in active.iterrows():
+                icon = "🔴" if alert["severity"] == "critical" else "🟠"
+                st.markdown(
+                    f"{icon} **{str(alert['severity']).upper()}** — `{alert['category']}` / `{alert['metric']}`  \\n{alert['message']}"
+                )
+
+        with st.expander("🗂️ Historical Alert Log", expanded=False):
+            history = alerts_df.sort_values("event_ts", ascending=False).copy()
+            history["event_ts"] = history["event_ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
+            st.dataframe(
+                history[
+                    [
+                        "event_ts",
+                        "run_id",
+                        "severity",
+                        "category",
+                        "metric",
+                        "value",
+                        "baseline",
+                        "delta",
+                        "message",
+                        "is_active",
+                    ]
+                ],
+                use_container_width=True,
+            )
 
     # ==================== RAW DATA ====================
     with st.expander("📊 View Historical Data Table"):
